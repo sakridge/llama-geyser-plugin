@@ -1,4 +1,6 @@
 /// Main entry for the PostgreSQL plugin
+///
+extern crate libloading;
 use {
     crate::{
         accounts_selector::AccountsSelector,
@@ -8,21 +10,37 @@ use {
     log::*,
     serde_derive::{Deserialize, Serialize},
     serde_json,
+    solana_sdk::hash::{hash, Hash},
     solana_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
         ReplicaTransactionInfoVersions, Result, SlotStatus,
     },
     solana_measure::measure::Measure,
     solana_metrics::*,
-    std::{fs::File, io::Read},
+    crossbeam_channel::{RecvTimeoutError, unbounded, Sender},
+    std::{collections::HashMap, thread::{JoinHandle, Builder}, time::Duration, ffi::{CString, c_char, c_int}, fs, fs::File, io::Read},
     thiserror::Error,
+    libloading::{Library, Symbol},
 };
+
+enum JobStatus {
+    Started,
+    Completed,
+}
+
+#[derive(Default)]
+struct Job {
+}
 
 #[derive(Default)]
 pub struct GeyserPluginPostgres {
     accounts_selector: Option<AccountsSelector>,
     transaction_selector: Option<TransactionSelector>,
     batch_starting_slot: Option<u64>,
+    library: Option<Library>,
+    worker_thread: Option<JoinHandle<()>>,
+    jobs: HashMap<Hash, JobStatus>,
+    job_sender: Option<Sender<llm::MLJob>>,
 }
 
 impl std::fmt::Debug for GeyserPluginPostgres {
@@ -30,6 +48,11 @@ impl std::fmt::Debug for GeyserPluginPostgres {
         Ok(())
     }
 }
+
+/*#[link(name = "libllama")]
+extern {
+    fn run_llm(argc: c_int, argv: *const *const c_char) -> c_int;
+}*/
 
 /// The Configuration for the PostgreSQL plugin
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -100,7 +123,12 @@ pub enum GeyserPluginPostgresError {
 
     #[error("Replica account V0.0.1 not supported anymore")]
     ReplicaAccountV001NotSupported,
+
+    #[error("LLM argument error")]
+    LlmArgumentError,
 }
+
+type RunLlmFunc = unsafe fn(argc: c_int, argv: *const *const c_char) -> c_int;
 
 impl GeyserPlugin for GeyserPluginPostgres {
     fn name(&self) -> &'static str {
@@ -173,15 +201,13 @@ impl GeyserPlugin for GeyserPluginPostgres {
             self.name(),
             config_file
         );
-        let mut file = File::open(config_file)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
+        let contents = fs::read_to_string(config_file)?;
 
         let result: serde_json::Value = serde_json::from_str(&contents).unwrap();
         self.accounts_selector = Some(Self::create_accounts_selector_from_config(&result));
         self.transaction_selector = Some(Self::create_transaction_selector_from_config(&result));
 
-        let config: GeyserPluginPostgresConfig =
+        let _config: GeyserPluginPostgresConfig =
             serde_json::from_str(&contents).map_err(|err| {
                 GeyserPluginError::ConfigFileReadError {
                     msg: format!(
@@ -190,6 +216,55 @@ impl GeyserPlugin for GeyserPluginPostgres {
                     ),
                 }
             })?;
+
+        unsafe {
+            self.library = Some(Library::new("libllama.dylib").unwrap());
+        }
+
+        let (sender, receiver) = unbounded::<llm::MLJob>();
+        self.job_sender = Some(sender);
+        self.worker_thread = Some(Builder::new().name("rpc-worker".to_string()).spawn(move || {
+            loop {
+                match receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(new_job) => {
+                        info!("job: {:?}", new_job);
+                        let client = reqwest::blocking::Client::builder()
+                            .timeout(Duration::from_secs(5))
+                            .build();
+                        let client = match client {
+                            Ok(client) => client,
+                            Err(err) => {
+                                warn!("client instantiation failed: {}", err);
+                                return;
+                            }
+                        };
+
+                        let body = new_job.parameters;
+                        let write_url = "http://127.0.0.1:9100/api/addjob";
+                        warn!("posting stuff.. to: {}", write_url);
+                        let response = client.post(write_url).body(body).send();
+                        if let Ok(resp) = response {
+                            let status = resp.status();
+                            if !status.is_success() {
+                                let text = resp
+                                    .text()
+                                    .unwrap_or_else(|_| "[text body empty]".to_string());
+                                warn!("submit response unsuccessful: {} {}", status, text,);
+                            } else {
+                                info!("response: {:?}", resp.text());
+                            }
+                        } else {
+                            warn!("submit error: {}", response.unwrap_err());
+                        }
+                    },
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break;
+                    },
+                    Err(e) => {
+                    }
+                }
+            }
+        }).unwrap());
 
         Ok(())
     }
@@ -231,6 +306,7 @@ impl GeyserPlugin for GeyserPluginPostgres {
                 let mut measure_select =
                     Measure::start("geyser-plugin-postgres-update-account-select");
                 if let Some(accounts_selector) = &self.accounts_selector {
+                    info!("selector?");
                     if !accounts_selector.is_account_selected(account.pubkey, account.owner) {
                         return Ok(());
                     }
@@ -244,6 +320,33 @@ impl GeyserPlugin for GeyserPluginPostgres {
                     100000,
                     100000
                 );
+
+                if let Ok(llm_account_data) = llm::MLJobPoolState::unpack(account.data) {
+                    for job in llm_account_data.jobs {
+                        let h = hash(&job.parameters);
+                        if !self.jobs.contains_key(&h) {
+                            if let Some(sender) = self.job_sender.as_ref() {
+                                info!("sending job {:?}", job);
+                                if let Err(e) = sender.send(job) {
+                                    info!("send error {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /* TODO: move to execute service
+                if llm_account_data.jobs.len() > self.jobs {
+                    let args = format!("-m {}", );
+                    let args = [CString::new("-c").map_err(|_e| GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::LlmArgumentError)))?.as_ptr()];
+
+                    self.jobs
+                }
+
+                unsafe {
+                    let func_run_llm: Symbol<RunLlmFunc> = self.library.as_ref().unwrap().get(b"run_llm").unwrap();
+                    func_run_llm(1, args.as_ptr());
+                }*/
 
                 debug!(
                     "Updating account {:?} with owner {:?} at slot {:?} using account selector {:?}",
@@ -320,7 +423,7 @@ impl GeyserPlugin for GeyserPluginPostgres {
 
     fn notify_block_metadata(&self, block_info: ReplicaBlockInfoVersions) -> Result<()> {
         match block_info {
-            ReplicaBlockInfoVersions::V0_0_2(block_info) => {
+            ReplicaBlockInfoVersions::V0_0_2(_block_info) => {
                 /*let result = client.update_block_metadata(block_info);
 
                 if let Err(err) = result {
@@ -374,6 +477,7 @@ impl GeyserPluginPostgres {
             } else {
                 Vec::default()
             };
+            info!("accounts: {:?}", accounts);
             let owners = &accounts_selector["owners"];
             let owners: Vec<String> = if owners.is_array() {
                 owners
@@ -428,7 +532,7 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use {super::*, serde_json};
+    use {super::*, serde_json, tempfile::NamedTempFile, std::{io::Write, path::PathBuf}, solana_sdk::pubkey::Pubkey, solana_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoV3};
 
     #[test]
     fn test_accounts_selector_from_config() {
@@ -438,5 +542,40 @@ pub(crate) mod tests {
 
         let config: serde_json::Value = serde_json::from_str(config).unwrap();
         GeyserPluginPostgres::create_accounts_selector_from_config(&config);
+    }
+
+    #[test]
+    fn test_library() {
+        let mut gp = GeyserPluginPostgres::new();
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let owner = Pubkey::new_unique();
+        let json = format!("{{\"accounts_selector\": {{\"owners\": [\"{owner}\"]}}, \"lib\": \"libllama.dylib\"}}");
+        write!(temp_file, "{}", json).unwrap();
+
+        let path = temp_file.path().to_str().unwrap();
+        gp.on_load(&path).unwrap();
+        let pk = Pubkey::new_unique();
+        let mut pool_state = llm::MLJobPoolState::default();
+        let mut job = llm::MLJob::default();
+        //job.parameters = "{\"stuff\": \"these are my parameters\"}".as_bytes().to_vec();
+        job.parameters = "{\"url\": \"http://myjob.blah\"}".as_bytes().to_vec();
+        pool_state.jobs.push(job);
+        let mut data = [0u8; 1024];
+        pool_state.pack(&mut data).unwrap();
+        let account = ReplicaAccountInfoV3 {
+            pubkey: pk.as_ref(),
+            lamports: 1,
+            owner: owner.as_ref(),
+            executable: false,
+            rent_epoch: 0,
+            data: &data,
+            write_version: 0,
+            txn: None,
+        };
+        let rep_account = ReplicaAccountInfoVersions::V0_0_3(&account);
+        gp.update_account(rep_account, 0, false).unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        gp.on_unload();
     }
 }
