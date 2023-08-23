@@ -20,7 +20,6 @@ use {
     crossbeam_channel::{RecvTimeoutError, unbounded, Sender},
     std::{collections::HashMap, thread::{JoinHandle, Builder}, time::Duration, ffi::{CString, c_char, c_int}, fs, fs::File, io::Read},
     thiserror::Error,
-    libloading::{Library, Symbol},
 };
 
 enum JobStatus {
@@ -37,7 +36,6 @@ pub struct GeyserPluginPostgres {
     accounts_selector: Option<AccountsSelector>,
     transaction_selector: Option<TransactionSelector>,
     batch_starting_slot: Option<u64>,
-    library: Option<Library>,
     worker_thread: Option<JoinHandle<()>>,
     jobs: HashMap<Hash, JobStatus>,
     job_sender: Option<Sender<llm::MLJob>>,
@@ -217,10 +215,6 @@ impl GeyserPlugin for GeyserPluginPostgres {
                 }
             })?;
 
-        unsafe {
-            self.library = Some(Library::new("libllama.dylib").unwrap());
-        }
-
         let (sender, receiver) = unbounded::<llm::MLJob>();
         self.job_sender = Some(sender);
         self.worker_thread = Some(Builder::new().name("rpc-worker".to_string()).spawn(move || {
@@ -334,19 +328,6 @@ impl GeyserPlugin for GeyserPluginPostgres {
                         }
                     }
                 }
-
-                /* TODO: move to execute service
-                if llm_account_data.jobs.len() > self.jobs {
-                    let args = format!("-m {}", );
-                    let args = [CString::new("-c").map_err(|_e| GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::LlmArgumentError)))?.as_ptr()];
-
-                    self.jobs
-                }
-
-                unsafe {
-                    let func_run_llm: Symbol<RunLlmFunc> = self.library.as_ref().unwrap().get(b"run_llm").unwrap();
-                    func_run_llm(1, args.as_ptr());
-                }*/
 
                 debug!(
                     "Updating account {:?} with owner {:?} at slot {:?} using account selector {:?}",
